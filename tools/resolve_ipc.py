@@ -38,6 +38,17 @@ spec = importlib.util.spec_from_file_location(
 rp = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(rp)
 
+# Optional auto-derivation: capstone lets us disassemble the wrapper and
+# pluck its own (funcHash, fencepost) pair directly from the mov imm32
+# instructions that write them.  Without capstone we fall back to the
+# hard-coded IPC_CONSTANTS table.  Auto-derivation is what eliminates the
+# need to hand-update this script on every Steam client re-roll.
+try:
+    from capstone import Cs, CS_ARCH_X86, CS_MODE_64
+    _HAS_CAPSTONE = True
+except ImportError:  # pragma: no cover - optional dep
+    _HAS_CAPSTONE = False
+
 HASH_WINDOW = 0x400
 
 # iface -> interface_id, RTTI TypeDescriptor name, and methods:
@@ -205,23 +216,88 @@ def check_wrapper(img, func_rva, funchash: str, pdata) -> bool:
     return bytes.fromhex(funchash)[::-1] in bytes(img.buf[o:o + HASH_WINDOW])
 
 
+def extract_wrapper_consts(buf, func_rva, window=0x200):
+    """Auto-derive (funcHash, fencepost) for a wrapper by disassembling it.
+
+    Steam IPC wrappers always carry a short prologue that issues two
+    `mov dword ptr [..], imm32` with the pair we want (funcHash, fencepost)
+    followed by the append-helper call.  The first two such movs inside the
+    first *window* bytes of the wrapper are the pair we need — every other
+    occurrence inside the full 0x400 HASH_WINDOW belongs to unrelated
+    protocol branches.  Returns (funcHash_hex_upper, fencepost_hex_upper)
+    or None if capstone is missing / the pattern is not found.
+    """
+    if not _HAS_CAPSTONE:
+        return None
+    e_lfanew = struct.unpack_from("<I", buf, 0x3C)[0]
+    nsec = struct.unpack_from("<H", buf, e_lfanew + 6)[0]
+    opt_size = struct.unpack_from("<H", buf, e_lfanew + 20)[0]
+    sect_off = e_lfanew + 24 + opt_size
+    file_off = None
+    for i in range(nsec):
+        so = sect_off + i * 40
+        vsize, vaddr, rsize, roff = struct.unpack_from("<IIII", buf, so + 8)
+        if vaddr <= func_rva < vaddr + max(vsize, rsize):
+            file_off = roff + (func_rva - vaddr)
+            break
+    if file_off is None:
+        return None
+    code = bytes(buf[file_off:file_off + window])
+    md = Cs(CS_ARCH_X86, CS_MODE_64)
+    md.detail = False
+    movs = []
+    for insn in md.disasm(code, func_rva):
+        if insn.mnemonic != "mov":
+            continue
+        op = insn.op_str
+        if "ptr [" not in op or ", 0x" not in op:
+            continue
+        parts = [p.strip() for p in op.split(",")]
+        if len(parts) != 2:
+            continue
+        src = parts[1].strip()
+        if not src.startswith("0x"):
+            continue
+        try:
+            val = int(src, 16) & 0xFFFFFFFF
+        except ValueError:
+            continue
+        movs.append(val)
+        if len(movs) >= 2:
+            return (f"{movs[0]:08X}", f"{movs[1]:08X}")
+    return None
+
+
 def resolve_iface(spec, img, spans, base, pdata):
     td = find_td(img, spans, spec["td"])
     if td is None:
-        return None, None, f'no TD {spec["td"]!r}'
+        return None, None, f'no TD {spec["td"]!r}', None
     vt, err = find_vtable(img, spans, td, base)
     if err is not None:
-        return None, None, err
+        return None, None, err, None
     methods = {}
-    for name, idx, funchash, _fence, _argc in spec["methods"]:
+    # resolved_consts[name] = (funcHash_upper, fencepost_upper) when auto-derived
+    resolved_consts = {}
+    for name, idx, funchash, fence, _argc in spec["methods"]:
         f = _u64(img, vt + idx * 8)
         if f is None:
-            return None, None, f"slot {idx} unreadable"
-        f -= base
-        if not check_wrapper(img, f, funchash, pdata):
-            return None, None, f"{name}: wrapper {f:#x} fails hash check"
+            return None, None, f"slot {idx} unreadable", None
+        f -= base  # RVA
+        auto_pair = extract_wrapper_consts(img.buf, f)
+        if auto_pair is not None:
+            resolved_consts[name] = auto_pair
+            # still sanity-check with hard-coded table if we have one
+            if funchash.upper() != auto_pair[0]:
+                print(f"  WARN {name}: auto funcHash={auto_pair[0]} vs "
+                      f"hard-coded={funchash.upper()} (fence={auto_pair[1]})")
+        elif check_wrapper(img, f, funchash, pdata):
+            # no capstone / no pattern → fall back to hard-coded hash check
+            resolved_consts[name] = (funchash.upper(), fence.upper())
+        else:
+            return None, None, f"{name}: wrapper {f:#x} fails hash check " \
+                               f"(and capstone auto-derivation disabled)", None
         methods[name] = f
-    return vt, methods, None
+    return vt, methods, None, resolved_consts
 
 
 def render_toml(resolved) -> str:
@@ -251,13 +327,24 @@ def cmd_resolve(args):
     entries = sorted(img.pdata_entries())
     pdata = set(entries)
     resolved, failed = [], []
+    if not _HAS_CAPSTONE:
+        print("WARN: capstone not installed; auto-derivation disabled, "
+              "falling back to hard-coded IPC_CONSTANTS")
     for iface, base_spec in IPC_IFACES.items():
         spec = channel_spec(iface, base_spec, args.channel)
-        vt, methods, err = resolve_iface(spec, img, spans, base, pdata)
+        vt, methods, err, auto_consts = resolve_iface(spec, img, spans, base, pdata)
         if err is not None:
             failed.append((iface, err))
             print(f"FAIL {iface}: {err}")
         else:
+            # Override spec's hard-coded funchash/fence with auto-derived
+            # values so render_toml emits the correct pair for *this* build.
+            if auto_consts is not None:
+                spec["methods"] = [
+                    (name, idx, auto_consts.get(name, (fh, fp))[0],
+                     auto_consts.get(name, (fh, fp))[1], argc)
+                    for (name, idx, fh, fp, argc) in spec["methods"]
+                ]
             resolved.append((iface, spec, vt, methods))
             print(f"{iface}: vtable=0x{vt:X} " +
                   " ".join(f"{m}=0x{w:X}" for m, w in methods.items()))
