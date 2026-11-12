@@ -66,17 +66,19 @@ IPC_IFACES = {
 
 # Per-channel wire constants: iface -> method -> (funcHash, fencepost).
 # Stable and beta are separate builds and have re-rolled these independently.
+# As of stable 1794424036 the two channels ship identical steamclient64.dll,
+# so the two sets below currently match (GetSteamID was the last hold-out).
 IPC_CONSTANTS = {
     "stable": {
         "IClientUser": {
             "GetSteamID": ("D6FC3200", "D7058CA5"),
-            "GetAppOwnershipTicketExtendedData": ("C7E71245", "C8449840"),
-            "RequestEncryptedAppTicket": ("25D6BB1D", "2646B663"),
-            "GetEncryptedAppTicket": ("E0468CB4", "E0B80200"),
+            "GetAppOwnershipTicketExtendedData": ("5578709F", "55D3418F"),
+            "RequestEncryptedAppTicket": ("BBB80477", "BC2703B9"),
+            "GetEncryptedAppTicket": ("25D6BB1C", "2646F563"),
         },
         "IClientUtils": {
-            "GetAppID": ("09607EC4", "0AFE7552"),
-            "GetAPICallResult": ("2D3D3947", "2EDF5EE6"),
+            "GetAppID": ("09607EC2", "0AFEF352"),
+            "GetAPICallResult": ("2D3D3979", "2EDFDD1A"),
         },
     },
     "beta": {
